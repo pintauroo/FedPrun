@@ -436,8 +436,8 @@ def main():
     ]
 
     # Define pruning policies to experiment with
-    # pruning_policies = [None, "GUP", "LUP", "LSP"]  # None represents no pruning
-    pruning_policies = ["GUP", "LUP", "LSP"]  # None represents no pruning
+    pruning_policies = [None, "GUP", "LUP", "LSP"]  # None represents no pruning
+    # pruning_policies = ["GUP", "LUP", "LSP"]  # None represents no pruning
 
     # Initialize list to collect all experiments metrics
     all_experiments_metrics = []
