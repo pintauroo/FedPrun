@@ -72,6 +72,47 @@ def partition_dataset_iid(dataset, num_clients=8):
     subsets = [Subset(dataset, idx) for idx in client_indices]
     return subsets
 
+def partition_dataset_noniid(dataset, num_clients=8, num_classes_per_client=2):
+    """
+    Splits the dataset into non-IID subsets for each client, each client has data from 'num_classes_per_client' classes.
+
+    Args:
+        dataset (torchvision.datasets): The dataset to partition.
+        num_clients (int): Number of clients.
+        num_classes_per_client (int): Number of classes per client.
+
+    Returns:
+        List[Subset]: List of dataset subsets for each client.
+    """
+    # Get all unique classes
+    classes = np.unique(dataset.targets)
+    num_classes = len(classes)
+
+    if num_classes_per_client > num_classes:
+        raise ValueError("Number of classes per client cannot exceed total number of classes.")
+
+    # Assign classes to clients
+    client_classes = {i: np.random.choice(classes, num_classes_per_client, replace=False) for i in range(num_clients)}
+
+    # Assign data indices to clients
+    client_indices = {i: [] for i in range(num_clients)}
+    for idx, target in enumerate(dataset.targets):
+        for client_id, assigned_classes in client_classes.items():
+            if target in assigned_classes:
+                client_indices[client_id].append(idx)
+                break  # Assign to the first client that has the class
+
+    # Handle any clients with no data by assigning them random data
+    for client_id in range(num_clients):
+        if len(client_indices[client_id]) == 0:
+            # Assign random indices to ensure every client has some data
+            random_idx = np.random.choice(len(dataset), size=100, replace=False)
+            client_indices[client_id].extend(random_idx.tolist())
+
+    # Create subsets
+    subsets = [Subset(dataset, client_indices[i]) for i in range(num_clients)]
+    return subsets
+
 # ----------------------------------------------------
 # 3. AVERAGE WEIGHTS FUNCTION
 # ----------------------------------------------------
@@ -391,7 +432,7 @@ class FederatedTrainer:
 # 6. MAIN FUNCTION
 # ----------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Federated Learning with Dynamic Pruning")
+    parser = argparse.ArgumentParser(description="Federated Learning with Dynamic Pruning and IID/Non-IID Data Partitioning")
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training and testing')
     parser.add_argument('--n_epochs', type=int, default=10, help='Number of federated training rounds')
     parser.add_argument('--n_client_epochs', type=int, default=3, help='Number of local epochs per client')
@@ -409,6 +450,8 @@ def main():
     parser.add_argument('--partB_indices_path', type=str, default="partB_indices.npy", help='Path to Part B indices file')
     parser.add_argument('--federated_model_save_dir', type=str, default="federated_models", help='Directory to save federated models')
     parser.add_argument('--experiments_results_path', type=str, default="experiments_results.json", help='Path to save experiments metrics')
+    parser.add_argument('--noniid', action='store_true', help='Enable non-IID data partitioning among clients')
+
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -429,7 +472,14 @@ def main():
     partB_subset = Subset(train_set, partB_indices)
 
     # Partition the dataset for federated learning (Part B)
-    client_subsets = partition_dataset_iid(partB_subset, num_clients=args.num_clients)
+    if args.noniid:
+        print("Partitioning data in a non-IID manner among clients.")
+        # You can adjust 'num_classes_per_client' as needed
+        client_subsets = partition_dataset_noniid(partB_subset, num_clients=args.num_clients, num_classes_per_client=2)
+    else:
+        print("Partitioning data in an IID manner among clients.")
+        client_subsets = partition_dataset_iid(partB_subset, num_clients=args.num_clients)
+    
     client_loaders = [
         DataLoader(cs, batch_size=args.batch_size, shuffle=True, num_workers=2)
         for cs in client_subsets
