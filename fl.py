@@ -77,40 +77,62 @@ def partition_dataset_noniid(dataset, num_clients=8, num_classes_per_client=2):
     Splits the dataset into non-IID subsets for each client, each client has data from 'num_classes_per_client' classes.
 
     Args:
-        dataset (torchvision.datasets): The dataset to partition.
+        dataset (torch.utils.data.Dataset or Subset): The dataset or Subset to partition.
         num_clients (int): Number of clients.
         num_classes_per_client (int): Number of classes per client.
 
     Returns:
         List[Subset]: List of dataset subsets for each client.
     """
-    # Get all unique classes
-    classes = np.unique(dataset.targets)
+    # Extract targets based on whether dataset is a Subset or full dataset
+    if isinstance(dataset, Subset):
+        # For Subset, access the underlying dataset's targets using the subset's indices
+        targets = np.array(dataset.dataset.targets)[dataset.indices]
+        dataset_indices = dataset.indices
+    else:
+        targets = np.array(dataset.targets)
+        dataset_indices = np.arange(len(dataset))
+
+    classes = np.unique(targets)
     num_classes = len(classes)
 
     if num_classes_per_client > num_classes:
         raise ValueError("Number of classes per client cannot exceed total number of classes.")
 
     # Assign classes to clients
-    client_classes = {i: np.random.choice(classes, num_classes_per_client, replace=False) for i in range(num_clients)}
+    client_classes = {}
+    for i in range(num_clients):
+        # Ensure unique class assignments across clients if possible
+        available_classes = list(set(classes) - set(client_classes.get(i, [])))
+        if len(available_classes) < num_classes_per_client:
+            available_classes = classes
+        assigned = np.random.choice(classes, num_classes_per_client, replace=False)
+        client_classes[i] = assigned
 
-    # Assign data indices to clients
+    # Assign data indices to clients based on assigned classes
     client_indices = {i: [] for i in range(num_clients)}
-    for idx, target in enumerate(dataset.targets):
+    for idx, target in zip(dataset_indices, targets):
+        # Assign to the first client that has the class
         for client_id, assigned_classes in client_classes.items():
             if target in assigned_classes:
                 client_indices[client_id].append(idx)
-                break  # Assign to the first client that has the class
+                break
 
     # Handle any clients with no data by assigning them random data
     for client_id in range(num_clients):
         if len(client_indices[client_id]) == 0:
             # Assign random indices to ensure every client has some data
-            random_idx = np.random.choice(len(dataset), size=100, replace=False)
+            if isinstance(dataset, Subset):
+                random_idx = np.random.choice(dataset_indices, size=100, replace=False)
+            else:
+                random_idx = np.random.choice(len(dataset), size=100, replace=False)
             client_indices[client_id].extend(random_idx.tolist())
 
     # Create subsets
-    subsets = [Subset(dataset, client_indices[i]) for i in range(num_clients)]
+    if isinstance(dataset, Subset):
+        subsets = [Subset(dataset.dataset, client_indices[i]) for i in range(num_clients)]
+    else:
+        subsets = [Subset(dataset, client_indices[i]) for i in range(num_clients)]
     return subsets
 
 # ----------------------------------------------------
@@ -450,6 +472,8 @@ def main():
     parser.add_argument('--partB_indices_path', type=str, default="partB_indices.npy", help='Path to Part B indices file')
     parser.add_argument('--federated_model_save_dir', type=str, default="federated_models", help='Directory to save federated models')
     parser.add_argument('--experiments_results_path', type=str, default="experiments_results.json", help='Path to save experiments metrics')
+    
+    # New argument for IID or Non-IID partitioning
     parser.add_argument('--noniid', action='store_true', help='Enable non-IID data partitioning among clients')
 
     args = parser.parse_args()
