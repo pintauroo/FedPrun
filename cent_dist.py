@@ -1,4 +1,4 @@
-# cent.py
+# cent_dist.py
 
 import torch
 import torch.nn as nn
@@ -366,9 +366,9 @@ class FederatedTrainer:
         Perform one iteration of consensus-based training.
 
         Args:
-            send_buffer: dictionary of {client_id: state_dict}.
+            send_buffer: dictionary of {client_id: state_dict (on CPU)}.
         """
-        # Step 1: Each client "sends" its model to a send_buffer
+        # Step 1: Each client "sends" its model to send_buffer (already on CPU)
         received_buffers = {i: copy.deepcopy(send_buffer[i]) for i in range(self.args.num_clients)}
 
         # Step 2: Each client receives models from its neighbors and updates its model
@@ -380,23 +380,26 @@ class FederatedTrainer:
             # 2.2. Receive models from neighbors
             received_models = [received_buffers[j] for j in all_neighbors]
 
-            # 2.3. Aggregate received models + local model
+            # 2.3. Aggregate received models with the local model (Averaging)
             x_aggregated = self.aggregate_models(received_models, send_buffer[i])
 
             # 2.4. Compute gradients based on local data
-            data_batch = self.sample_local_data(i)
-            gradients = self.compute_gradients(x_aggregated, data_batch, i)
+            data_subset = self.sample_local_data(i)
+            gradients = self.compute_gradients(x_aggregated, data_subset, i)
 
-            # 2.5. Update local model
+            # 2.5. Update local model with aggregated model and gradients
+            # All operations here are on CPU to save GPU memory
             updated_state = {}
             for key in x_aggregated.keys():
-                updated_state[key] = x_aggregated[key] - self.args.lr * gradients[key]
+                updated_state[key] = x_aggregated[key] - self.args.lr * gradients[key].cpu()
 
             x_new[i] = updated_state
 
-        # Step 3: Update all client models
+        # Step 3: Update all client models (move the final state back to GPU)
         for i in range(self.args.num_clients):
-            self.client_models[i].load_state_dict(x_new[i])
+            self.client_models[i].load_state_dict({
+                k: v.to(self.device) for k, v in x_new[i].items()
+            })
 
     def get_neighbors(self, worker_id: int, adjacency_matrix: np.ndarray) -> List[int]:
         """
@@ -409,20 +412,23 @@ class FederatedTrainer:
         return neighbors
 
     def aggregate_models(
-        self, models: List[Dict[str, torch.Tensor]], local_model: Dict[str, torch.Tensor]
+        self, models_list: List[Dict[str, torch.Tensor]], local_model: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
         """
         Aggregate (average) neighbor models with the local model.
+        All models are expected to be on CPU.
         """
-        total_models = models + [local_model]
+        total_models = models_list + [local_model]  # Include the local model in the aggregation
         aggregated_model = {}
         for key in local_model.keys():
+            # Stack all tensors for this key and compute mean
             aggregated_model[key] = torch.stack([m[key] for m in total_models], dim=0).mean(dim=0)
         return aggregated_model
 
     def sample_local_data(self, client_id: int) -> Subset:
         """
-        Sample a batch of data for a client. Currently returning the entire train_set for simplicity.
+        Sample a batch of data for a client.
+        Currently returning the entire train_set for simplicity.
         Adjust logic here if you want mini-batch sampling.
         """
         return self.train_set
@@ -436,13 +442,18 @@ class FederatedTrainer:
         """
         Compute gradients for the given model state and data batch.
         """
+        # Initialize a temporary model for gradient computation
         model = create_vgg16_for_cifar10(num_classes=10).to(self.device)
-        model.load_state_dict(model_state)
+        model.load_state_dict({k: v.to(self.device) for k, v in model_state.items()})
         model.train()
         optimizer = optim.SGD(model.parameters(), lr=self.args.lr, momentum=self.args.momentum)
         criterion = nn.CrossEntropyLoss()
 
         loader = DataLoader(data_batch, batch_size=self.args.batch_size, shuffle=True, num_workers=2)
+        epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_samples = 0
+
         for data, target in loader:
             data, target = data.to(self.device), target.to(self.device)
             optimizer.zero_grad()
@@ -451,7 +462,12 @@ class FederatedTrainer:
             loss.backward()
             optimizer.step()
 
-        # Extract final gradients after one pass (or more) through data_batch
+            epoch_loss += loss.item() * data.size(0)
+            _, predicted = outputs.max(1)
+            epoch_correct += predicted.eq(target).sum().item()
+            epoch_samples += data.size(0)
+
+        # Extract gradients after one pass
         gradients = {}
         for name, param in model.named_parameters():
             if param.grad is not None:
@@ -478,16 +494,16 @@ class FederatedTrainer:
         for epoch in range(1, self.args.n_epochs + 1):
             if self.consensus:
                 print(f"\n=== Consensus-Based Federated Round {epoch}/{self.args.n_epochs} ===")
-                # Step 1: Prepare the buffer
-                send_buffer = {
-                    i: copy.deepcopy(self.client_models[i].state_dict())
-                    for i in range(self.args.num_clients)
-                }
+                # Step 1: Move each client's model state to CPU and store in send_buffer
+                send_buffer = {}
+                for i in range(self.args.num_clients):
+                    model_state_cpu = {k: v.cpu() for k, v in self.client_models[i].state_dict().items()}
+                    send_buffer[i] = copy.deepcopy(model_state_cpu)
 
-                # Step 2: Perform one iteration of consensus-based model exchange
+                # Step 2: Perform consensus-based model exchange and update
                 self._train_consensus_iteration(send_buffer)
 
-                # Evaluate client models after each round
+                # Step 3: Evaluate client models after each round
                 print("\n=== Evaluating Client Models After Federated Training ===")
                 round_losses, round_accuracies = self.test_baseline()
                 avg_round_loss = float(np.mean(round_losses))
@@ -569,6 +585,7 @@ class FederatedTrainer:
                     self.args.log_every, len(train_losses)
                 )
 
+                # Collect round metrics
                 round_metrics = {
                     "round": epoch,
                     "avg_train_loss": avg_train_loss,
