@@ -57,6 +57,7 @@ def load_cifar10_data(batch_size=128, download=True, data_root="./data"):
         root=data_root, train=False, download=download, transform=transform_test
     )
 
+    # If memory is tight, consider setting num_workers=0
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True, num_workers=2
     )
@@ -269,10 +270,14 @@ class FederatedTrainer:
     def apply_pruning(self, model: nn.Module, policy: str, amount: float):
         """
         Applies the specified pruning policy to the model and removes pruning reparameterization.
+        IMPORTANT: we do this on the CPU to avoid GPU OOM errors during global pruning.
         """
+        # Move the model to CPU for pruning
+        model_cpu = model.to("cpu")
+
         if policy == "GUP":
             parameters_to_prune = []
-            for name, module in model.named_modules():
+            for name, module in model_cpu.named_modules():
                 if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                     parameters_to_prune.append((module, "weight"))
 
@@ -282,24 +287,30 @@ class FederatedTrainer:
                 amount=amount
             )
         elif policy == "LUP":
-            for name, module in model.named_modules():
+            for name, module in model_cpu.named_modules():
                 if isinstance(module, nn.Conv2d) or isinstance(module, nn.Linear):
                     prune.l1_unstructured(module, name="weight", amount=amount)
         elif policy == "LSP":
-            for name, module in model.named_modules():
+            for name, module in model_cpu.named_modules():
                 if isinstance(module, nn.Conv2d):
                     prune.ln_structured(module, name="weight", amount=amount, n=2, dim=0)
                 elif isinstance(module, nn.Linear):
                     prune.ln_structured(module, name="weight", amount=amount, n=2, dim=0)
         else:
-            raise ValueError(f"Unknown pruning policy: {policy}")
+            if policy is not None:
+                raise ValueError(f"Unknown pruning policy: {policy}")
 
         # Remove pruning reparameterization to avoid state_dict issues
-        self.remove_pruning_reparameterization(model)
+        self.remove_pruning_reparameterization(model_cpu)
+
+        # Move the pruned model back to the original device
+        model.load_state_dict(model_cpu.state_dict())
+        model.to(self.device)
 
     def remove_pruning_reparameterization(self, model: nn.Module):
         """
-        Removes pruning reparameterization from the model to ensure state_dict contains only standard keys.
+        Removes pruning reparameterization from the model to ensure the state_dict 
+        contains only standard parameters and no 'mask' or 'orig' buffers.
         """
         for name, module in model.named_modules():
             if isinstance(module, (nn.Conv2d, nn.Linear)):
@@ -454,6 +465,7 @@ class FederatedTrainer:
         epoch_correct = 0
         epoch_samples = 0
 
+        # Single pass for gradient computation
         for data, target in loader:
             data, target = data.to(self.device), target.to(self.device)
             optimizer.zero_grad()
@@ -497,7 +509,9 @@ class FederatedTrainer:
                 # Step 1: Move each client's model state to CPU and store in send_buffer
                 send_buffer = {}
                 for i in range(self.args.num_clients):
-                    model_state_cpu = {k: v.cpu() for k, v in self.client_models[i].state_dict().items()}
+                    model_state_cpu = {
+                        k: v.cpu() for k, v in self.client_models[i].state_dict().items()
+                    }
                     send_buffer[i] = copy.deepcopy(model_state_cpu)
 
                 # Step 2: Perform consensus-based model exchange and update
@@ -799,7 +813,7 @@ def main():
 
         if args.consensus:
             # No single "global" model to evaluate; each client is separate.
-            # We'll store placeholder metrics or aggregate them as needed.
+            # We'll store placeholder metrics or aggregated metrics as needed.
             fed_loss, fed_acc = 0.0, 0.0
             print("\nFinal Federated models have been trained using the consensus-based approach.")
         else:
@@ -824,6 +838,7 @@ def main():
         json.dump(all_experiments_metrics, f, indent=4)
     print(f"\nAll experiments metrics saved to {args.experiments_results_path}")
     print("\nAll federated training experiments completed.")
+
 
 if __name__ == "__main__":
     main()
